@@ -1,0 +1,231 @@
+clc; clear; close all;
+
+%% Parameters
+numUAVs = 6;
+radarRange = 1800;             % max radar radius in meters
+numCircles = 15;
+numSteps = 50;                 % simulate for 50 seconds
+dt = 1;
+
+% Load drone image and resize
+droneImg = imread('dronee.jpg');
+droneImg = imresize(droneImg, [50 NaN]); 
+
+% Radar circles
+circleRadii = linspace(radarRange/numCircles, radarRange, numCircles);
+
+% Swarm drone initial positions
+swarmSpacing = 250; 
+swarmY = -radarRange + 100;
+swarmXPositions = linspace(-swarmSpacing*(numUAVs-1)/2, swarmSpacing*(numUAVs-1)/2, numUAVs);
+swarmPositions = [swarmXPositions' repmat(swarmY, numUAVs, 1)];
+swarmVelocity = [0 20]; 
+
+% Unknown drone
+unknownPos = [2500, 2500];
+unknownVelocity = [-60, -60]; 
+unknownActive = true;
+
+% Attack time params (keep for your original swarm movement during attack)
+attackStartTime = 0;
+attackDuration = 3;
+
+% Logging directory
+logFolder = 'C:\Users\josep\Downloads\dronelogs';
+if ~isfolder(logFolder)
+    mkdir(logFolder);
+end
+
+% Precompute for circle drawing
+theta = linspace(0, 2*pi, 250);
+
+% --- MAVLink protocol setup ---
+HEARTBEAT = 0;
+COMMAND_LONG = 76;
+MISSION_ACK = 47;
+CMD_ATTACK = 300; % Custom attack command
+
+createMAVLinkMessage = @(msgID, sysID, compID, payload) struct( ...
+    'msgID', msgID, ...
+    'sysID', sysID, ...
+    'compID', compID, ...
+    'payload', payload, ...
+    'timestamp', datetime('now'));
+
+parseMAVLinkMessage = @(msg) msg;  % dummy parser
+
+% Message queues
+radarToDronesQueue = {};   
+dronesToRadarQueue = {};   
+
+% Firing status tracking
+firingStatus = false(1,numUAVs);
+
+% --- Plot setup ---
+figure('Color', 'k');
+hold on;
+axis equal;
+xlim([-2000 2000]);
+ylim([-2000 2000]);
+set(gca,'Color','k','XColor','w','YColor','w');
+grid on;
+
+% Simulation loop
+for t = 1:numSteps
+    cla;
+    
+    % Radar circles
+    for r = circleRadii
+        xC = r * cos(theta);
+        yC = r * sin(theta);
+        plot(xC, yC, 'g:', 'LineWidth', 1.2);
+    end
+    plot(0,0,'go','MarkerSize',10,'MarkerFaceColor','g');
+    
+    % Update swarm positions
+    swarmPositions = swarmPositions + swarmVelocity * dt;
+    for i = 1:numUAVs
+        if norm(swarmPositions(i,:)) > radarRange
+            swarmPositions(i,2) = -radarRange + (swarmPositions(i,2) - radarRange);
+        end
+    end
+    
+    % Plot swarm drones
+    imgSize = 70;
+    for i = 1:numUAVs
+        pos = swarmPositions(i,:);
+        image('XData',[pos(1)-imgSize/2, pos(1)+imgSize/2], ...
+              'YData',[pos(2)-imgSize/2, pos(2)+imgSize/2], ...
+              'CData', droneImg);
+        text(pos(1)+imgSize/2, pos(2), sprintf('UAV%d',i), 'Color','w', 'FontSize', 10);
+    end
+    
+    % Update and plot unknown drone
+    if unknownActive
+        unknownPos = unknownPos + unknownVelocity * dt;
+        image('XData', [unknownPos(1)-imgSize/2, unknownPos(1)+imgSize/2], ...
+              'YData', [unknownPos(2)-imgSize/2, unknownPos(2)+imgSize/2], ...
+              'CData', droneImg);
+        text(unknownPos(1)+imgSize/2, unknownPos(2), 'Unknown', 'Color', 'w', 'FontSize', 10);
+    end
+    
+    % Detection and logging (unchanged)
+    logFile = fullfile(logFolder, 'drone_log.txt');
+    if unknownActive && norm(unknownPos) <= radarRange && ~exist(logFile, 'file')
+        disp('Unknown drone entered radar range!');
+        
+        try
+            % Save log file
+            fid = fopen(logFile, 'w');
+            fprintf(fid, 'Unknown Drone Detected\n');
+            timestamp = datetime('now','Format','yyyy-MM-dd HH:mm:ss');
+            fprintf(fid, 'Time: %s\n', string(timestamp));
+            fprintf(fid, 'Coordinates: [%.2f, %.2f]\n', unknownPos(1), unknownPos(2));
+            fclose(fid);
+
+            zoomRadius = 150;  % adjust this for tighter or wider zoom
+            xlim([unknownPos(1) - zoomRadius, unknownPos(1) + zoomRadius]);
+            ylim([unknownPos(2) - zoomRadius, unknownPos(2) + zoomRadius]);
+            drawnow;
+
+            % Capture zoomed-in image
+            imgFile = fullfile(logFolder, 'unknown_drone.jpg');
+            frame = getframe(gca);
+            imwrite(frame.cdata, imgFile);
+
+            % Reset full radar view
+            xlim([-2000 2000]);
+            ylim([-2000 2000]);
+
+            disp('Zoomed log image of unknown drone saved successfully!');
+        end
+        
+        zipFile = fullfile(logFolder, 'encrypted_logs.zip');
+        sevenZipPath = '"C:\Program Files\7-Zip\7z.exe"';
+        cmd = sprintf('%s a -tzip -p%s -y "%s" "%s" "%s"', sevenZipPath, '1101', zipFile, logFile, imgFile);
+
+        status = system(cmd);
+
+        if status == 0
+            delete(logFile);   % Remove plain files
+            delete(imgFile);
+            disp('Encrypted zip file created successfully!');
+        else
+            disp('Error creating encrypted zip file.');
+        end
+    end
+    
+    % --- MAVLink communication logic ---
+
+    % Radar sends COMMAND_LONG attack command to all drones on first detection:
+    if unknownActive && norm(unknownPos) <= radarRange && ...
+            ~any(cellfun(@(m) m.msgID == COMMAND_LONG, radarToDronesQueue))
+        
+        disp('Radar: Unknown drone detected! Sending ATTACK command to drones.');
+        
+        for i=1:numUAVs
+            payload = struct('command', CMD_ATTACK, 'param1', 0, 'param2', 0);
+            cmdMsg = createMAVLinkMessage(COMMAND_LONG, 0, i, payload); % sysID=0 (ground), compID=drone ID
+            radarToDronesQueue{end+1} = cmdMsg;
+        end
+    end
+    
+    % Drones process incoming commands
+    for i = 1:numUAVs
+        toRemove = [];
+        for idx = 1:length(radarToDronesQueue)
+            msg = radarToDronesQueue{idx};
+            if msg.compID == i && msg.msgID == COMMAND_LONG
+                parsedMsg = parseMAVLinkMessage(msg);
+                if parsedMsg.payload.command == CMD_ATTACK
+                    fprintf('Drone %d: Received ATTACK command. Engaging target.\n', i);
+
+                    % Drone sends back ACK
+                    ackPayload = struct('command', CMD_ATTACK, 'result', 0); % success
+                    ackMsg = createMAVLinkMessage(MISSION_ACK, i, 1, ackPayload);
+                    dronesToRadarQueue{end+1} = ackMsg;
+
+                    % Set firing flag
+                    firingStatus(i) = true;
+
+                    toRemove(end+1) = idx; % Remove command after processing
+                end
+            end
+        end
+        radarToDronesQueue(toRemove) = [];
+    end
+    
+    % Radar processes ACK messages from drones
+    ackIndices = [];
+    for idx = 1:length(dronesToRadarQueue)
+        ackMsg = dronesToRadarQueue{idx};
+        if ackMsg.msgID == MISSION_ACK
+            fprintf('Radar: Received ACK from Drone %d for command %d.\n', ackMsg.sysID, ackMsg.payload.command);
+            ackIndices(end+1) = idx;
+        end
+    end
+    dronesToRadarQueue(ackIndices) = [];
+    
+    % Drones firing visualization: draw lines from drone to unknown drone
+    for i=1:numUAVs
+        if firingStatus(i)
+            dronePos = swarmPositions(i,:);
+            line([dronePos(1) unknownPos(1)], [dronePos(2) unknownPos(2)], ...
+                'Color', 'r', 'LineWidth', 2, 'LineStyle', '-.');
+        end
+    end
+    
+    % --- Original swarm attack movement (optional) ---
+    if t >= attackStartTime && t < attackStartTime + attackDuration
+        % Move swarm toward unknown drone (optional)
+        attackVel = 100;
+        direction = unknownPos - swarmPositions;
+        dist = sqrt(sum(direction.^2, 2));
+        normDir = direction ./ dist;
+        normDir(dist == 0,:) = 0;
+        swarmPositions = swarmPositions + normDir * attackVel * dt;
+    end
+    
+    % Pause for visualization
+    pause(1);
+end
